@@ -31,10 +31,12 @@ import iaik.pkcs.pkcs11.objects.Data; // For ToBeSigned
 // Using local implementations instead of eu.europa.esig.dss classes
 import org.apache.commons.lang3.StringUtils;
 import org.apache.pdfbox.pdmodel.interactive.digitalsignature.SignatureOptions;
+import org.apache.pdfbox.pdmodel.PDDocument; // Added for page count
 import org.openpdfsign.pkcs11.*;
 
 import java.io.IOException;
 import java.io.OutputStream;
+import java.math.BigInteger;
 import java.nio.file.Path;
 import java.security.KeyStore;
 import java.security.cert.X509Certificate;
@@ -43,6 +45,10 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+
+import org.bouncycastle.asn1.ASN1EncodableVector;
+import org.bouncycastle.asn1.ASN1Integer;
+import org.bouncycastle.asn1.DERSequence;
 
 
 /**
@@ -301,6 +307,12 @@ private CommonCertificateVerifier createCertificateVerifier(PAdESSignatureParame
              if (keyAlgorithmString != null && (keyAlgorithmString.toUpperCase().contains("EC") || keyAlgorithmString.toUpperCase().contains("ECDSA"))) {
                  encryptionAlgorithm = EncryptionAlgorithm.ECDSA;
                  log.debug("Determined encryption algorithm: ECDSA for key type: " + keyAlgorithmString);
+                 
+                 // 对于ECDSA签名，需要将P1363格式转换为ASN.1 DER格式
+                 byte[] derSignature = convertECDSASignatureP1363ToDER(customSignatureValue.getValue());
+                 log.debug("Converted ECDSA signature from P1363 to DER format. Original length: " + 
+                          customSignatureValue.getValue().length + ", DER length: " + derSignature.length);
+                 customSignatureValue = new org.openpdfsign.pkcs11.SignatureValue(customDigestAlgorithm, derSignature);
              } else if (keyAlgorithmString != null && keyAlgorithmString.toUpperCase().contains("RSA")) {
                  encryptionAlgorithm = EncryptionAlgorithm.RSA;
                  log.debug("Determined encryption algorithm: RSA for key type: " + keyAlgorithmString);
@@ -355,6 +367,41 @@ private CommonCertificateVerifier createCertificateVerifier(PAdESSignatureParame
         timestampDataLoader.setProxyConfig(proxyConfig);
         return new OnlineTSPSource(source, timestampDataLoader);
     }
+    
+    /**
+     * 将ECDSA签名从P1363格式（r和s值的简单连接）转换为ASN.1 DER格式
+     * P1363格式是PKCS#11令牌返回的原始格式，而PDF验证需要ASN.1 DER格式
+     * 
+     * @param p1363Signature ECDSA签名的P1363格式（r和s值的简单连接）
+     * @return ECDSA签名的ASN.1 DER格式
+     */
+    private byte[] convertECDSASignatureP1363ToDER(byte[] p1363Signature) {
+        try {
+            // P1363格式是r和s值的简单连接，每个值占据签名字节数组的一半
+            int halfLength = p1363Signature.length / 2;
+            
+            // 提取r和s值
+            byte[] rBytes = Arrays.copyOfRange(p1363Signature, 0, halfLength);
+            byte[] sBytes = Arrays.copyOfRange(p1363Signature, halfLength, p1363Signature.length);
+            
+            // 转换为BigInteger（注意：BigInteger构造函数将字节数组视为有符号的，因此我们需要确保正确处理）
+            BigInteger r = new BigInteger(1, rBytes);
+            BigInteger s = new BigInteger(1, sBytes);
+            
+            // 创建ASN.1 DER序列
+            ASN1EncodableVector vector = new ASN1EncodableVector();
+            vector.add(new ASN1Integer(r));
+            vector.add(new ASN1Integer(s));
+            DERSequence sequence = new DERSequence(vector);
+            
+            // 编码为DER格式
+            return sequence.getEncoded();
+        } catch (Exception e) {
+            log.error("Error converting ECDSA signature from P1363 to DER format: " + e.getMessage(), e);
+            // 如果转换失败，返回原始签名
+            return p1363Signature;
+        }
+    }
 
     // 添加一些必要的辅助方法来分解原始signPdf方法的功能
     private void configureSignatureParameters(PAdESSignatureParameters signatureParameters,
@@ -362,13 +409,13 @@ private CommonCertificateVerifier createCertificateVerifier(PAdESSignatureParame
         // 从原始signPdf方法中提取签名参数配置逻辑
         if (params.getUseLT()) {
             signatureParameters.setSignatureLevel(SignatureLevel.PAdES_BASELINE_LT);
-            signatureParameters.setContentSize((int) (SignatureOptions.DEFAULT_SIGNATURE_SIZE * 2.5)); // Increased from 1.5 to 2.5
+            signatureParameters.setContentSize((int) (SignatureOptions.DEFAULT_SIGNATURE_SIZE * 5.0)); // Increased from 1.5 to 2.5
         } else if (params.getUseLTA()) {
             signatureParameters.setSignatureLevel(SignatureLevel.PAdES_BASELINE_LTA);
-            signatureParameters.setContentSize((int) (SignatureOptions.DEFAULT_SIGNATURE_SIZE * 3.0)); // Increased from 1.75 to 3.0
+            signatureParameters.setContentSize((int) (SignatureOptions.DEFAULT_SIGNATURE_SIZE * 6.0)); // Increased from 1.75 to 3.0
         } else if (params.getUseTimestamp() || !params.getTSA().isEmpty()) {
             signatureParameters.setSignatureLevel(SignatureLevel.PAdES_BASELINE_T);
-            signatureParameters.setContentSize((int) (SignatureOptions.DEFAULT_SIGNATURE_SIZE * 1.5));
+            signatureParameters.setContentSize((int) (SignatureOptions.DEFAULT_SIGNATURE_SIZE * 7.5));
         } else {
             signatureParameters.setSignatureLevel(SignatureLevel.PAdES_BASELINE_B);
         }
