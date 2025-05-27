@@ -34,6 +34,7 @@ import org.apache.commons.lang3.StringUtils;
 import org.apache.pdfbox.cos.COSDictionary;
 import org.apache.pdfbox.cos.COSName;
 import org.apache.pdfbox.pdmodel.PDPage;
+import org.apache.pdfbox.pdmodel.common.PDRectangle;
 import org.apache.pdfbox.pdmodel.interactive.digitalsignature.SignatureOptions;
 import org.apache.pdfbox.pdmodel.PDDocument; // Added for page count
 import org.openpdfsign.dss.PdfBoxNativeTableObjectFactory;
@@ -58,7 +59,7 @@ import org.bouncycastle.asn1.DERSequence;
 /**
  * Extension of the Signer class that adds support for HSM (Hardware Security Module) signing
  * using PKCS#11 interface.
- * 
+ *
  * This implementation uses a PKCS#11 token for signing operations, but creates a JKS token wrapper
  * to make it compatible with the parent Signer class which expects a JKSSignatureToken.
  * The JKS token wrapper delegates the actual signing operation to the PKCS#11 token.
@@ -71,7 +72,7 @@ public class HSMSigner extends Signer {
 
     /**
      * Signs a PDF document using either a JKS keystore or an HSM via PKCS#11.
-     * 
+     *
      * @param pdfFile The PDF file to sign
      * @param outputFile The output file where the signed PDF will be saved
      * @param keyStore The keystore bytes (used only if HSM is not used)
@@ -190,7 +191,7 @@ private CommonCertificateVerifier createCertificateVerifier(PAdESSignatureParame
     /**
      * Signs a PDF document using the provided token and key.
      * This method uses the parent class's signPdf method with the custom token.
-     * 
+     *
      * @param pdfFile The PDF file to sign
      * @param outputFile The output file where the signed PDF will be saved
      * @param binaryOutput The output stream for binary output (optional)
@@ -271,8 +272,75 @@ private CommonCertificateVerifier createCertificateVerifier(PAdESSignatureParame
                     } else {
                         fieldParameters.setPage(params.getPage());
                     }
-                    fieldParameters.setOriginX(params.getLeft() * POINTS_PER_MM * 10f);
-                    fieldParameters.setOriginY(params.getTop() * POINTS_PER_MM * 10f);
+                    // Calculate coordinates
+                    PDDocument pdDocForCoords = PDDocument.load(toSignDocument.openStream());
+                    PDPage pageForCoords;
+                    int pageIndexToUse;
+                    if (params.getPage() < 0) {
+                        pageIndexToUse = pdDocForCoords.getNumberOfPages() + params.getPage();
+                    } else {
+                        // params.getPage() is 1-indexed from user, convert to 0-indexed for PDFBox
+                        pageIndexToUse = params.getPage() -1;
+                        if (pageIndexToUse < 0) pageIndexToUse = 0; // Ensure not negative
+                    }
+                    pageForCoords = pdDocForCoords.getPage(pageIndexToUse);
+
+                    PDRectangle mediaBox = pageForCoords.getMediaBox();
+                    int pageRotation = pageForCoords.getRotation();
+                    log.debug("Page index for signature: " + pageIndexToUse + ", Rotation: " + pageRotation + " degrees.");
+
+                    // These are dimensions of the *unrotated* page, which is what PDRectangle expects.
+                    float pageWidth = mediaBox.getWidth();
+                    float pageHeight = mediaBox.getHeight();
+                    log.debug(String.format("MediaBox dimensions (unrotated): Width=%.2f pts, Height=%.2f pts", pageWidth, pageHeight));
+                    pdDocForCoords.close();
+
+                    float signatureWidthPx = params.getWidth() * POINTS_PER_MM * 10f;
+                    float estimatedSignatureHeightPx = signatureWidthPx * 0.6f; // Example: height is 60% of width
+                    log.debug(String.format("Signature params: WidthCm=%.2f (%.2f pts), EstimatedHeightPx=%.2f",
+                        params.getWidth(), signatureWidthPx, estimatedSignatureHeightPx));
+
+                    // X Coordinate Calculation
+                    // Precedence: 1. --right, 2. --left (which defaults to 0cm if not specified)
+                    if (params.getRight() != null) {
+                        // --right is specified, use it.
+                        // OriginX (bottom-left of signature) = pageWidth - (right_offset_in_points) - signature_width_in_points.
+                        float xFromRightOffset = params.getRight() * POINTS_PER_MM * 10f;
+                        fieldParameters.setOriginX(pageWidth - xFromRightOffset - signatureWidthPx);
+                        log.debug(String.format("X ALIGNMENT: Using --right. rightOffsetCm=%.2f, rightOffsetPx=%.2f, pageWidth=%.2f, sigWidthPx=%.2f, OriginX=%.2f",
+                                params.getRight(), xFromRightOffset, pageWidth, signatureWidthPx,
+                                fieldParameters.getOriginX()));
+                    } else {
+                        // --right is NOT specified, so use --left (params.getLeft() will return its value or default 0f).
+                        // 'left' parameter means distance from the page left edge to the signature field's left edge.
+                        // OriginX is the X coordinate of the lower-left corner of the signature field.
+                        float xFromLeftOffset = params.getLeft() * POINTS_PER_MM * 10f;
+                        fieldParameters.setOriginX(xFromLeftOffset);
+                        log.debug(String.format("X ALIGNMENT: Using --left (right not specified). leftOffsetCm=%.2f, leftOffsetPx=%.2f, OriginX=%.2f",
+                                params.getLeft(), xFromLeftOffset, fieldParameters.getOriginX()));
+                    }
+
+                    // Y Coordinate Calculation
+                    // Precedence: 1. --bottom, 2. --top (which defaults to 0cm if not specified)
+                    if (params.getBottom() != null) {
+                        // --bottom is specified, use it.
+                        // PDFBox Y-coordinate starts from the bottom (0 at bottom, increases upwards).
+                        // OriginY is the Y coordinate of the lower-left corner of the signature field.
+                        float yFromBottomOffset = params.getBottom() * POINTS_PER_MM * 10f;
+                        fieldParameters.setOriginY(yFromBottomOffset);
+                        log.debug(String.format("Y ALIGNMENT: Using --bottom. bottomOffsetCm=%.2f, bottomOffsetPx=%.2f, OriginY=%.2f",
+                                params.getBottom(), yFromBottomOffset, fieldParameters.getOriginY()));
+                    } else {
+                        // --bottom is NOT specified, so use --top (params.getTop() will return its value or default 0f).
+                        // 'top' parameter means distance from the page top to the signature field's top edge.
+                        // OriginY (bottom-left of signature) = pageHeight - (top_offset_in_points) - signature_height_in_points.
+                        float yFromTopOffset = params.getTop() * POINTS_PER_MM * 10f;
+                        fieldParameters.setOriginY(pageHeight - yFromTopOffset - estimatedSignatureHeightPx);
+                        log.debug(String.format("Y ALIGNMENT: Using --top (bottom not specified). topOffsetCm=%.2f, topOffsetPx=%.2f, pageHeight=%.2f, estSignHeightPx=%.2f, OriginY=%.2f",
+                                params.getTop(), yFromTopOffset, pageHeight, estimatedSignatureHeightPx,
+                                fieldParameters.getOriginY()));
+                    }
+
                     fieldParameters.setWidth(params.getWidth() * POINTS_PER_MM * 10f);
 
                     // Set signature date with timezone consideration
@@ -332,7 +400,7 @@ private CommonCertificateVerifier createCertificateVerifier(PAdESSignatureParame
             // 获取要签名的数据
             eu.europa.esig.dss.model.ToBeSigned dataToSign = service.getDataToSign(toSignDocument, signatureParameters);
 
-           
+
             // Convert EU DSS ToBeSigned to custom ToBeSigned
             org.openpdfsign.pkcs11.ToBeSigned customToBeSigned = new org.openpdfsign.pkcs11.ToBeSigned(dataToSign.getBytes());
 // 檢查數據長度
@@ -358,10 +426,10 @@ private CommonCertificateVerifier createCertificateVerifier(PAdESSignatureParame
              if (keyAlgorithmString != null && (keyAlgorithmString.toUpperCase().contains("EC") || keyAlgorithmString.toUpperCase().contains("ECDSA"))) {
                  encryptionAlgorithm = EncryptionAlgorithm.ECDSA;
                  log.debug("Determined encryption algorithm: ECDSA for key type: " + keyAlgorithmString);
-                 
+
                  // 对于ECDSA签名，需要将P1363格式转换为ASN.1 DER格式
                  byte[] derSignature = convertECDSASignatureP1363ToDER(customSignatureValue.getValue());
-                 log.debug("Converted ECDSA signature from P1363 to DER format. Original length: " + 
+                 log.debug("Converted ECDSA signature from P1363 to DER format. Original length: " +
                           customSignatureValue.getValue().length + ", DER length: " + derSignature.length);
                  customSignatureValue = new org.openpdfsign.pkcs11.SignatureValue(customDigestAlgorithm, derSignature);
              } else if (keyAlgorithmString != null && keyAlgorithmString.toUpperCase().contains("RSA")) {
@@ -418,11 +486,11 @@ private CommonCertificateVerifier createCertificateVerifier(PAdESSignatureParame
         timestampDataLoader.setProxyConfig(proxyConfig);
         return new OnlineTSPSource(source, timestampDataLoader);
     }
-    
+
     /**
      * 将ECDSA签名从P1363格式（r和s值的简单连接）转换为ASN.1 DER格式
      * P1363格式是PKCS#11令牌返回的原始格式，而PDF验证需要ASN.1 DER格式
-     * 
+     *
      * @param p1363Signature ECDSA签名的P1363格式（r和s值的简单连接）
      * @return ECDSA签名的ASN.1 DER格式
      */
@@ -430,21 +498,21 @@ private CommonCertificateVerifier createCertificateVerifier(PAdESSignatureParame
         try {
             // P1363格式是r和s值的简单连接，每个值占据签名字节数组的一半
             int halfLength = p1363Signature.length / 2;
-            
+
             // 提取r和s值
             byte[] rBytes = Arrays.copyOfRange(p1363Signature, 0, halfLength);
             byte[] sBytes = Arrays.copyOfRange(p1363Signature, halfLength, p1363Signature.length);
-            
+
             // 转换为BigInteger（注意：BigInteger构造函数将字节数组视为有符号的，因此我们需要确保正确处理）
             BigInteger r = new BigInteger(1, rBytes);
             BigInteger s = new BigInteger(1, sBytes);
-            
+
             // 创建ASN.1 DER序列
             ASN1EncodableVector vector = new ASN1EncodableVector();
             vector.add(new ASN1Integer(r));
             vector.add(new ASN1Integer(s));
             DERSequence sequence = new DERSequence(vector);
-            
+
             // 编码为DER格式
             return sequence.getEncoded();
         } catch (Exception e) {

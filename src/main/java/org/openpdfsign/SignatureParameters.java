@@ -37,6 +37,14 @@ public class SignatureParameters {
     @JsonProperty("width")
     private float width = 10;
 
+    @Parameter(required = false, names={"--right"}, description = "X offset from the right edge of the page in cm")
+    @JsonProperty("right")
+    private Float right = null;
+
+    @Parameter(required = false, names={"--bottom"}, description = "Y offset from the bottom edge of the page in cm")
+    @JsonProperty("bottom")
+    private Float bottom = null;
+
     @Parameter(required = false, names={"--hint"}, description = "text to be displayed in signature field")
     @JsonProperty("hint")
     private String hint;
