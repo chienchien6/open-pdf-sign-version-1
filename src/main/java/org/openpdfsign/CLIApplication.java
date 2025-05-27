@@ -38,9 +38,16 @@ public class CLIApplication {
 
         log.debug("Running with parameters: " + cla);
 
+        // Initialize Configuration with properties file if provided
+        if (!Strings.isStringEmpty(cla.getPropertiesFile())) {
+            Configuration.getInstance(null, cla.getPropertiesFile());
+        }
+
         //load locale, if any
         if (!Strings.isStringEmpty(cla.getLocale())) {
-            Configuration.getInstance(Locale.forLanguageTag(cla.getLocale()));
+            // If properties file was provided, Configuration instance already exists
+            // Otherwise, get instance (which will load default application.properties)
+            Configuration.getInstance(Locale.forLanguageTag(cla.getLocale()), cla.getPropertiesFile());
         }
 
         //convert to keystore, if not already given

@@ -20,11 +20,15 @@ public class Configuration {
     private PropertiesConfiguration properties;
     private ResourceBundle resourceBundle;
 
-    private Configuration(Locale locale) {
+    private Configuration(Locale locale, String propertiesFilePath) {
         //load from properties file
         Configurations configurations = new Configurations();
         try {
-            this.properties = configurations.properties("application.properties");
+            if (propertiesFilePath != null && !propertiesFilePath.isEmpty()) {
+                this.properties = configurations.properties(propertiesFilePath);
+            } else {
+                this.properties = configurations.properties("application.properties");
+            }
             properties.setListDelimiterHandler(new DefaultListDelimiterHandler(','));
 
             //load resourceBundle, if any
@@ -46,18 +50,19 @@ public class Configuration {
         }
     }
 
-    public static Configuration getInstance(Locale locale) {
+    public static Configuration getInstance(Locale locale, String propertiesFilePath) {
         if (INSTANCE == null) {
-            INSTANCE = new Configuration(locale);
+            INSTANCE = new Configuration(locale, propertiesFilePath);
         }
         return INSTANCE;
     }
 
+    public static Configuration getInstance(Locale locale) {
+        return getInstance(locale, null);
+    }
+
     public static Configuration getInstance() {
-        if (INSTANCE == null) {
-            INSTANCE = new Configuration(null);
-        }
-        return INSTANCE;
+        return getInstance(null, null);
     }
 
     /**

@@ -63,6 +63,10 @@ public class CommandLineArguments extends SignatureParameters {
     @JsonProperty("certificates")
     private ArrayList<HostKeyCertificatePair> certificates;
 
+    @Parameter(required = false, names={"--properties-file"}, description = "path to external properties file")
+    @JsonProperty("properties-file")
+    private String propertiesFile;
+
     @Getter
     @Setter
     public static class HostKeyCertificatePair {

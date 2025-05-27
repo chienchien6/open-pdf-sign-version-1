@@ -71,7 +71,7 @@ public class SessionInitiator {
                 System.out.println("Token Model: " + new String(tokenInfo.getModel()).trim());
                 System.out.println("Token Serial Number: " + new String(tokenInfo.getSerialNumber()).trim());
             } catch (TokenException te) {
-                System.out.println("Error getting token info: " + te.getMessage());
+//                System.out.println("Error getting token info: " + te.getMessage());
                 te.printStackTrace();
                 // Optionally, rethrow or handle as critical error if token info is essential
             }

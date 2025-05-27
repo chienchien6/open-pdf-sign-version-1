@@ -14,6 +14,7 @@ import eu.europa.esig.dss.model.x509.CertificateToken;
 import eu.europa.esig.dss.pades.PAdESSignatureParameters;
 import eu.europa.esig.dss.pades.SignatureImageParameters;
 import eu.europa.esig.dss.pades.signature.PAdESService;
+import eu.europa.esig.dss.pdf.pdfbox.PdfBoxNativeObjectFactory;
 import eu.europa.esig.dss.service.crl.OnlineCRLSource;
 import eu.europa.esig.dss.service.http.commons.TimestampDataLoader;
 import eu.europa.esig.dss.service.http.proxy.ProxyConfig;
@@ -30,21 +31,24 @@ import iaik.pkcs.pkcs11.Mechanism; // For DigestAlgorithm
 import iaik.pkcs.pkcs11.objects.Data; // For ToBeSigned
 // Using local implementations instead of eu.europa.esig.dss classes
 import org.apache.commons.lang3.StringUtils;
+import org.apache.pdfbox.cos.COSDictionary;
+import org.apache.pdfbox.cos.COSName;
+import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.interactive.digitalsignature.SignatureOptions;
 import org.apache.pdfbox.pdmodel.PDDocument; // Added for page count
+import org.openpdfsign.dss.PdfBoxNativeTableObjectFactory;
 import org.openpdfsign.pkcs11.*;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.math.BigInteger;
 import java.nio.file.Path;
 import java.security.KeyStore;
 import java.security.cert.X509Certificate;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
 
 import org.bouncycastle.asn1.ASN1EncodableVector;
 import org.bouncycastle.asn1.ASN1Integer;
@@ -60,6 +64,8 @@ import org.bouncycastle.asn1.DERSequence;
  * The JKS token wrapper delegates the actual signing operation to the PKCS#11 token.
  */
 public class HSMSigner extends Signer {
+    private static final float POINTS_PER_INCH = 72;
+    private static final float POINTS_PER_MM = 1 / (10 * 2.54f) * POINTS_PER_INCH;
 
     private static final Logger log = Logger.getLogger(HSMSigner.class);
 
@@ -232,7 +238,6 @@ private CommonCertificateVerifier createCertificateVerifier(PAdESSignatureParame
 
             // 配置可视签名（如果需要）
             if (params.getPage() != null) {
-                // Implement visible signature configuration inline instead of calling a separate method
                 SignatureImageParameters imageParameters = new SignatureImageParameters();
                 TableSignatureFieldParameters fieldParameters = new TableSignatureFieldParameters();
                 imageParameters.setFieldParameters(fieldParameters);
@@ -244,12 +249,58 @@ private CommonCertificateVerifier createCertificateVerifier(PAdESSignatureParame
                         imageParameters.setImage(new InMemoryDocument(IOUtils.toByteArray(getClass().getClassLoader().getResourceAsStream("signature.png"))));
                     }
 
-                    fieldParameters.setPage(params.getPage());
-                    fieldParameters.setOriginX(params.getLeft() * 7.2f); // Convert mm to points
-                    fieldParameters.setOriginY(params.getTop() * 7.2f);
-                    fieldParameters.setWidth(params.getWidth() * 7.2f);
+                    // Add new page if user requested, force reopen document
+                    if (params.getAddPage() != null && params.getAddPage() == true) {
+                        PDDocument pdDocument = PDDocument.load(toSignDocument.openStream());
+                        PDPage newPage = new PDPage(pdDocument.getPage(pdDocument.getNumberOfPages() - 1).getMediaBox());
+                        pdDocument.addPage(newPage);
+                        Set<COSDictionary> cosSet = new HashSet<>();
+                        cosSet.add(newPage.getCOSObject().getCOSDictionary(COSName.PARENT));
+                        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+                        pdDocument.saveIncremental(bos, cosSet);
+                        pdDocument.close();
+                        toSignDocument = new InMemoryDocument(bos.toByteArray());
+                    }
+
+                    if (params.getPage() < 0) {
+                        PDDocument pdDocument = PDDocument.load(toSignDocument.openStream());
+                        int pageCount = pdDocument.getNumberOfPages();
+                        fieldParameters.setPage(pageCount + (1 + params.getPage()));
+                        pdDocument.close();
+                        log.debug("PDF page count: " + pageCount);
+                    } else {
+                        fieldParameters.setPage(params.getPage());
+                    }
+                    fieldParameters.setOriginX(params.getLeft() * POINTS_PER_MM * 10f);
+                    fieldParameters.setOriginY(params.getTop() * POINTS_PER_MM * 10f);
+                    fieldParameters.setWidth(params.getWidth() * POINTS_PER_MM * 10f);
+
+                    // Set signature date with timezone consideration
+                    DateTimeFormatter formatter = DateTimeFormatter.ISO_OFFSET_DATE_TIME.withZone(ZoneId.systemDefault());
+                    if (params.getTimezone() != null) {
+                        formatter = formatter.withZone(ZoneId.of(params.getTimezone()));
+                    }
+                    fieldParameters.setSignatureDate(formatter.format(signatureParameters.getSigningDate().toInstant()));
+                    fieldParameters.setSignaturString(signingKey.getCertificate().getSubjectDN().getName());
+                    fieldParameters.setLabelHint(org.apache.commons.lang3.ObjectUtils.firstNonNull(params.getLabelHint(), Configuration.getInstance().getResourceBundle().getString("hint")));
+                    fieldParameters.setLabelSignee(org.apache.commons.lang3.ObjectUtils.firstNonNull(params.getLabelSignee(), Configuration.getInstance().getResourceBundle().getString("signee")));
+                    fieldParameters.setLabelTimestamp(org.apache.commons.lang3.ObjectUtils.firstNonNull(params.getLabelTimestamp(), Configuration.getInstance().getResourceBundle().getString("timestamp")));
+                    if (!Strings.isStringEmpty(params.getHint())) {
+                        fieldParameters.setHint(params.getHint());
+                    } else {
+                        if (params.getNoHint()) {
+                            fieldParameters.setHint(null);
+                        } else {
+                            fieldParameters.setHint(Configuration.getInstance().getResourceBundle().getString("hint_text"));
+                        }
+                    }
+                    fieldParameters.setImageOnly(params.getImageOnly());
 
                     signatureParameters.setImageParameters(imageParameters);
+
+                    PdfBoxNativeObjectFactory pdfBoxNativeObjectFactory = new PdfBoxNativeTableObjectFactory();
+                    service.setPdfObjFactory(pdfBoxNativeObjectFactory);
+                    log.debug("Visible signature parameters set");
                 } catch (Exception e) {
                     log.error("Error configuring visible signature: " + e.getMessage(), e);
                 }
