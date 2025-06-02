@@ -63,4 +63,9 @@ java -jar openpdfsign.jar --input ruiting.pdf --output output.pdf --hsm-library 
 
 
 
+只能簽ECC私鑰,若是用不同Type的key去簽,會報錯 Not supported conversion from SignatureAlgorithm 'RSA_SHA256' defined within SignatureValue to the target algorithm 'ECDSA_SHA256'
+
+cert跟key不同演算法: Error signing PDF: The SignatureAlgorithm within the SignatureValue 'ECDSA_SHA256' does not match the expected value : 'RSA_SHA256'. Conversion is not supported!      
+
+
 
