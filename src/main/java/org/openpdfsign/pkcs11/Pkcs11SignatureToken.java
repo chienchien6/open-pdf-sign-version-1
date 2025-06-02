@@ -20,6 +20,8 @@ import java.util.List;
  * Implementation of SignatureTokenConnection for PKCS#11 tokens.
  * This class directly uses IAIK PKCS#11 Wrapper to interact with HSM.
  */
+import org.openpdfsign.SignatureParameters; // Added import
+
 public class Pkcs11SignatureToken implements SignatureTokenConnection {
 
     private static final Logger log = Logger.getLogger(Pkcs11SignatureToken.class);
@@ -27,6 +29,7 @@ public class Pkcs11SignatureToken implements SignatureTokenConnection {
     private String pkcs11LibraryPath;
     private KeyStore.PasswordProtection passwordProtection;
     private int slotIndex;
+    private SignatureParameters signatureParams; // Added field for SignatureParameters
     private Module pkcs11Module;
     private Session session;
     private List<DSSPrivateKeyEntry> keys = new ArrayList<>();
@@ -37,11 +40,13 @@ public class Pkcs11SignatureToken implements SignatureTokenConnection {
      * @param pkcs11LibraryPath The path to the PKCS#11 library
      * @param passwordProtection The password protection for the token
      * @param slotIndex The slot index to use
+     * @param params The signature parameters, used for certificate label lookup
      */
-    public Pkcs11SignatureToken(String pkcs11LibraryPath, KeyStore.PasswordProtection passwordProtection, int slotIndex) {
+    public Pkcs11SignatureToken(String pkcs11LibraryPath, KeyStore.PasswordProtection passwordProtection, int slotIndex, SignatureParameters params) { // Added SignatureParameters
         this.pkcs11LibraryPath = pkcs11LibraryPath;
         this.passwordProtection = passwordProtection;
         this.slotIndex = slotIndex;
+        this.signatureParams = params; // Store SignatureParameters
 
         try {
             // Initialize the PKCS#11 module
@@ -72,52 +77,77 @@ public class Pkcs11SignatureToken implements SignatureTokenConnection {
             // For each private key, find the corresponding certificate and create a DSSPrivateKeyEntry
             for (Object obj : foundKeys) {
                 PrivateKey privateKey = (PrivateKey) obj;
+                X509PublicKeyCertificate pkcs11Cert = null;
+                Object[] foundCerts = null;
 
-                // Find the certificate with the same label as the key
-                X509PublicKeyCertificate certTemplate = new X509PublicKeyCertificate();
-                char[] keyLabel = privateKey.getLabel().getCharArrayValue();
-                log.debug("Looking for certificate with label: " + new String(keyLabel));
-                certTemplate.getLabel().setCharArrayValue(keyLabel);
+                String hsmCertLabelParam = (this.signatureParams != null) ? this.signatureParams.getHsmCertLabel() : null;
 
-                session.findObjectsInit(certTemplate);
-                Object[] foundCerts = session.findObjects(1);
-                session.findObjectsFinal();
+                if (hsmCertLabelParam != null && !hsmCertLabelParam.isEmpty()) {
+                    log.debug("Attempting to find certificate using --hsm-cert-label: '" + hsmCertLabelParam + "'");
+                    X509PublicKeyCertificate certTemplateByParam = new X509PublicKeyCertificate();
+                    certTemplateByParam.getLabel().setCharArrayValue(hsmCertLabelParam.toCharArray());
+                    session.findObjectsInit(certTemplateByParam);
+                    foundCerts = session.findObjects(1);
+                    session.findObjectsFinal();
+                    if (foundCerts.length > 0) {
+                        pkcs11Cert = (X509PublicKeyCertificate) foundCerts[0];
+                        log.debug("Found certificate using --hsm-cert-label: '" + hsmCertLabelParam + "'");
+                    } else {
+                        log.debug("No certificate found using --hsm-cert-label: '" + hsmCertLabelParam + "'");
+                    }
+                }
 
-                log.debug("Found " + foundCerts.length + " certificates with matching label");
+                // If pkcs11Cert is still null (i.e., not found by hsmCertLabelParam if it was provided),
+                // AND hsmCertLabelParam was not provided (null or empty), then try the default label "X509 Certificate".
+                if (pkcs11Cert == null && (hsmCertLabelParam == null || hsmCertLabelParam.isEmpty())) {
+                    log.debug("Certificate not found by a specific --hsm-cert-label (or no label was provided). Trying with default label 'X509 Certificate'.");
+                    String defaultCertLabel = "X509 Certificate";
+                    X509PublicKeyCertificate certTemplateDefault = new X509PublicKeyCertificate();
+                    certTemplateDefault.getLabel().setCharArrayValue(defaultCertLabel.toCharArray());
+                    session.findObjectsInit(certTemplateDefault);
+                    foundCerts = session.findObjects(1); // Reusing foundCerts declared in the loop
+                    session.findObjectsFinal();
+                    if (foundCerts.length > 0) {
+                        pkcs11Cert = (X509PublicKeyCertificate) foundCerts[0];
+                        log.debug("Found certificate with default label: '" + defaultCertLabel + "'");
+                    } else {
+                        log.debug("No certificate found with default label: '" + defaultCertLabel + "'");
+                    }
+                }
 
-                if (foundCerts.length > 0) {
-                    X509PublicKeyCertificate pkcs11Cert = (X509PublicKeyCertificate) foundCerts[0];
+                // After all applicable attempts, if no certificate is found for the current private key, throw an error.
+                if (pkcs11Cert == null) {
+                    String errorMessage;
+                    char[] currentKeyLabelChars = privateKey.getLabel().getCharArrayValue();
+                    String currentKeyLabel = "[unlabeled private key]";
+                    if (currentKeyLabelChars != null && currentKeyLabelChars.length > 0) {
+                        currentKeyLabel = "'" + new String(currentKeyLabelChars) + "'";
+                    }
 
+                    if (hsmCertLabelParam != null && !hsmCertLabelParam.isEmpty()) {
+                        // This means hsmCertLabelParam was provided, and lookup for that label failed.
+                        // The default label "X509 Certificate" was not attempted by the logic above in this specific case.
+                        errorMessage = "No X509 certificate found in HSM for private key " + currentKeyLabel +
+                                       " using the specified --hsm-cert-label: '" + hsmCertLabelParam + "'.";
+                    } else {
+                        // This means hsmCertLabelParam was NOT provided (or was empty).
+                        // The default label "X509 Certificate" was attempted and failed.
+                        errorMessage = "No X509 certificate found in HSM for private key " + currentKeyLabel +
+                                       " using the default label 'X509 Certificate' (as --hsm-cert-label was not provided or was empty).";
+                    }
+                    log.error(errorMessage);
+                    throw new IOException(errorMessage); // This will be caught by the existing catch block in the constructor
+                }
+
+                if (pkcs11Cert != null) {
                     // Convert PKCS#11 certificate to Java X509Certificate
                     X509Certificate[] certChain = convertToX509CertificateChain(pkcs11Cert);
-
                     // Create a DSSPrivateKeyEntry
                     IAIKPrivateKeyEntry entry = new IAIKPrivateKeyEntry(privateKey, pkcs11Cert, certChain);
                     keys.add(entry);
-                    log.debug("Added key with alias: " + entry.getAlias());
+                    log.debug("Added key with alias: '" + entry.getAlias() + "' associated with certificate subject: '" + certChain[0].getSubjectX500Principal().getName() + "'");
                 } else {
-                    // Try to find any certificate if we couldn't find one with matching label
-                    log.debug("No certificate found with matching label, trying to find any certificate");
-                    X509PublicKeyCertificate anyCertTemplate = new X509PublicKeyCertificate();
-
-                    session.findObjectsInit(anyCertTemplate);
-                    Object[] anyFoundCerts = session.findObjects(1);
-                    session.findObjectsFinal();
-
-                    if (anyFoundCerts.length > 0) {
-                        log.debug("Found a certificate without matching label");
-                        X509PublicKeyCertificate pkcs11Cert = (X509PublicKeyCertificate) anyFoundCerts[0];
-
-                        // Convert PKCS#11 certificate to Java X509Certificate
-                        X509Certificate[] certChain = convertToX509CertificateChain(pkcs11Cert);
-
-                        // Create a DSSPrivateKeyEntry
-                        IAIKPrivateKeyEntry entry = new IAIKPrivateKeyEntry(privateKey, pkcs11Cert, certChain);
-                        keys.add(entry);
-                        log.debug("Added key with alias: " + entry.getAlias());
-                    } else {
-                        log.debug("No certificate found at all, skipping this key");
-                    }
+                    // This case is now handled by the log.warn above if no cert is found at all.
                 }
             }
         } catch (TokenException | IOException | CertificateException e) {

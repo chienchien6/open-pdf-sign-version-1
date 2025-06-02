@@ -50,6 +50,8 @@ import java.security.cert.X509Certificate;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import org.bouncycastle.asn1.ASN1EncodableVector;
 import org.bouncycastle.asn1.ASN1Integer;
@@ -104,7 +106,8 @@ public class HSMSigner extends Signer {
             token = new Pkcs11SignatureToken(
                     params.getHsmLibrary(),
                     new KeyStore.PasswordProtection(params.getHsmPin().toCharArray()),
-                    params.getHsmSlot()
+                    params.getHsmSlot(),
+                    params // Pass SignatureParameters
             );
 
             // 获取密钥
@@ -114,8 +117,8 @@ public class HSMSigner extends Signer {
             }
 
             // 选择签名密钥
-            DSSPrivateKeyEntry signingKey = selectSigningKey(keys, params.getHsmKeyAlias());
-            // 打印密鑰算法和證書信息
+            DSSPrivateKeyEntry signingKey = selectSigningKey(keys, params);
+            // 打印密鑰算法和證書信息 is now part of selectSigningKey logging or done after this call as before
 log.debug("Key Algorithm: " + signingKey.getEncryptionAlgorithm());
 log.debug("Certificate SN: " + signingKey.getCertificate().getSerialNumber());
             // 直接使用token进行签名
@@ -176,18 +179,90 @@ private CommonCertificateVerifier createCertificateVerifier(PAdESSignatureParame
     return commonCertificateVerifier;
 }
 
-    private DSSPrivateKeyEntry selectSigningKey(List<DSSPrivateKeyEntry> keys,
-                                                String alias) throws IOException {
-        if (Strings.isStringEmpty(alias)) {
-            return keys.get(0);
-        }
-        return keys.stream()
-                .filter(key -> alias.equals(key.getAlias()))
-                .findFirst()
-                .orElseThrow(() -> new IOException(
-                        "Key with alias '" + alias + "' not found in HSM"
-                ));
+private DSSPrivateKeyEntry selectSigningKey(List<DSSPrivateKeyEntry> keys,
+                                            SignatureParameters params) throws IOException {
+    String pkeyLabel = params.getHsmPkeyLabel();
+    String certLabel = params.getHsmCertLabel();
+
+    // Ensure there are keys to select from
+    if (keys.isEmpty()) {
+        throw new IOException("No keys found in HSM. Cannot select a signing key.");
     }
+
+    Stream<DSSPrivateKeyEntry> stream = keys.stream();
+    String usedCriteria = "none (defaulting to first key)";
+    boolean criteriaProvided = false;
+
+    // Log available key aliases/labels for debugging
+
+        String availableAliases = keys.stream()
+                                    .map(DSSPrivateKeyEntry::getAlias)
+                                    .filter(Objects::nonNull)
+                                    .distinct()
+                                    .collect(Collectors.joining(", "));
+        log.debug("Available key aliases/labels in HSM: [" + availableAliases + "]");
+
+    
+    // hsmPkeyLabel is now mandatory for key selection.
+    if (Strings.isStringEmpty(pkeyLabel)) {
+        log.error("HSM private key label (--hsm-pkey-label) not specified. This parameter is now mandatory.");
+        throw new IOException("HSM private key label (--hsm-pkey-label) not specified. This parameter is now mandatory.");
+    }
+
+    // At this point, pkeyLabel is guaranteed to be non-empty.
+    log.debug("Attempting to select key using hsmPkeyLabel: '" + pkeyLabel + "'");
+    // This assumes key.getAlias() corresponds to the CKA_LABEL of the CKO_PRIVATE_KEY object.
+    // Class CKO_PRIVATE_KEY and Type (e.g., CKK_ECDSA) are implicitly handled by Pkcs11SignatureToken.
+    stream = stream.filter(key -> pkeyLabel.equals(key.getAlias()));
+    usedCriteria = "hsmPkeyLabel='" + pkeyLabel + "'";
+    criteriaProvided = true; // pkeyLabel is the only criterion now, and it was provided.
+
+    // Collect the filtered keys. This list will be used by the subsequent code.
+    List<DSSPrivateKeyEntry> filteredKeys = stream.collect(Collectors.toList());
+
+    if (filteredKeys.isEmpty()) {
+        // This block is reached if pkeyLabel was provided, but no key matched it.
+        // criteriaProvided is implicitly true here.
+        String availableAliasesForError = keys.stream()
+                                            .map(DSSPrivateKeyEntry::getAlias)
+                                            .filter(Objects::nonNull)
+                                            .distinct()
+                                            .collect(Collectors.joining("', '"));
+        throw new IOException("Key with specified hsmPkeyLabel '" + pkeyLabel + "' not found in HSM. " +
+                              "Available aliases/labels: ['" + availableAliasesForError + "']. " +
+                              "Ensure the label matches exactly and the private key object exists with that label.");
+    }
+    // If filteredKeys is not empty, the code following this replaced block will handle it
+    // (e.g., warning for multiple matches, selecting the first one).
+    // The `return keys.get(0);` from the original `else` branch (no criteria) is correctly removed,
+    // as lack of pkeyLabel is now an error handled above.
+
+    if (filteredKeys.size() > 1 && criteriaProvided) {
+        String matchingAliases = filteredKeys.stream()
+                                        .map(DSSPrivateKeyEntry::getAlias)
+                                        .filter(Objects::nonNull)
+                                        .distinct()
+                                        .collect(Collectors.joining("', '"));
+        log.warn("Multiple keys (" + filteredKeys.size() + ") found matching criteria (" + usedCriteria + "): ['" + matchingAliases + "']. " +
+                 "Using the first one found: '" + (filteredKeys.get(0).getAlias() != null ? filteredKeys.get(0).getAlias() : "NO_ALIAS") + "'. " +
+                 "Consider using a more specific label if this is not the intended key.");
+    }
+    
+    DSSPrivateKeyEntry selectedKey = filteredKeys.get(0);
+
+        log.debug("Selected key with alias/label: '" + (selectedKey.getAlias() != null ? selectedKey.getAlias() : "NO_ALIAS") + "' using criteria: " + usedCriteria);
+        log.debug("Selected key's PKCS#11 object class is implicitly CKO_PRIVATE_KEY.");
+        log.debug("Selected key's PKCS#11 object type (e.g. CKK_ECDSA, CKK_RSA) reflected in algorithm: " + selectedKey.getEncryptionAlgorithm());
+        if (selectedKey.getCertificate() != null) {
+            log.debug("Associated certificate's PKCS#11 object class is implicitly CKO_CERTIFICATE, type CKC_X_509.");
+            log.debug("Selected key's certificate SN: " + selectedKey.getCertificate().getSerialNumber());
+            log.debug("Selected key's certificate SubjectDN: " + selectedKey.getCertificate().getSubjectX500Principal().getName());
+        } else {
+            log.warn("Selected key does not have an associated certificate in DSSPrivateKeyEntry.");
+        }
+
+    return selectedKey;
+}
     /**
      * Signs a PDF document using the provided token and key.
      * This method uses the parent class's signPdf method with the custom token.

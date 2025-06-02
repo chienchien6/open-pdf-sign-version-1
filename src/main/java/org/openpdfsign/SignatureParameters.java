@@ -121,9 +121,14 @@ public class SignatureParameters {
     @JsonProperty("hsm-pin")
     private String hsmPin;
 
-    @Parameter(required = false, names={"--hsm-key-alias"}, description = "alias of the key in the HSM to use for signing")
-    @JsonProperty("hsm-key-alias")
-    private String hsmKeyAlias;
+
+    @Parameter(required = false, names={"--hsm-cert-label"}, description = "label of the certificate in the HSM to use for signing")
+    @JsonProperty("hsm-cert-label")
+    private String hsmCertLabel;
+
+    @Parameter(required = false, names={"--hsm-pkey-label"}, description = "label of the private key in the HSM to use for signing")
+    @JsonProperty("hsm-pkey-label")
+    private String hsmPkeyLabel;
 
     public static enum CertificationMode {
         NOT_CERTIFIED("not-certified"),
